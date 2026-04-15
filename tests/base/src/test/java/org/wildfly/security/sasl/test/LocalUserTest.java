@@ -27,11 +27,16 @@ import static org.junit.Assert.fail;
 import java.io.File;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.Provider;
 import java.security.Security;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 
 import javax.security.auth.callback.CallbackHandler;
 import javax.security.auth.callback.UnsupportedCallbackException;
@@ -41,6 +46,7 @@ import javax.security.sasl.SaslException;
 import javax.security.sasl.SaslServer;
 
 import org.junit.AfterClass;
+import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.wildfly.common.iteration.CodePointIterator;
@@ -427,6 +433,86 @@ public class LocalUserTest {
         assertTrue("Temporary file was created.", file.exists());
         server.dispose();
         assertFalse("Temporary file was deleted.", file.exists());
+    }
+
+    /**
+     * Test that custom POSIX permissions can be specified for the challenge file.
+     */
+    @Test
+    public void testChallengeFilePermissions_SF() throws Exception {
+        final Path challengeDirectory = new File(System.getProperty("java.io.tmpdir")).toPath();
+        Assume.assumeTrue(challengeDirectory.getFileSystem().supportedFileAttributeViews().contains("posix"));
+
+        final Set<PosixFilePermission> expectedPermissions = PosixFilePermissions.fromString("rw-------");
+        final Map<String, Object> serverOptions = new HashMap<>();
+        serverOptions.put("wildfly.sasl.local-user.challenge-file-permissions", "rw-------");
+
+        SaslServer server = new SaslServerBuilder(LocalUserServerFactory.class, LOCAL_USER)
+                .setUserName("George")
+                .setProperties(serverOptions)
+                .build();
+
+        try {
+            byte[] challenge = server.evaluateResponse(new byte[0]);
+            challenge = server.evaluateResponse(new byte[]{0}); // Simulate initial message from client.
+            final File file = new File(new String(challenge, StandardCharsets.UTF_8));
+
+            assertEquals("Unexpected permissions on challenge file.", expectedPermissions, Files.getPosixFilePermissions(file.toPath()));
+        } finally {
+            server.dispose();
+        }
+    }
+
+    @Test
+    public void testChallengeFilePermissionsRejectsInvalidPermissionString() throws Exception {
+        final Path challengeDirectory = new File(System.getProperty("java.io.tmpdir")).toPath();
+        final Map<String, Object> serverOptions = new HashMap<>();
+        serverOptions.put("wildfly.sasl.local-user.challenge-file-permissions", "invalid");
+
+        try {
+            SaslServer server = new SaslServerBuilder(LocalUserServerFactory.class, LOCAL_USER)
+                    .setUserName("George")
+                    .setProperties(serverOptions)
+                    .build();
+
+            try {
+                server.evaluateResponse(new byte[0]);
+                server.evaluateResponse(new byte[]{0});
+                fail("Expected invalid permission configuration to be rejected.");
+            } finally {
+                server.dispose();
+            }
+        } catch (IllegalArgumentException | SaslException expected) {
+            if (!challengeDirectory.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+                assertTrue("Expected non-POSIX failure to mention POSIX attribute support.",
+                        expected.getMessage().contains("POSIX"));
+            }
+        }
+    }
+
+    @Test
+    public void testLegacyChallengeFilePermissionsProperty_SF() throws Exception {
+        final Path challengeDirectory = new File(System.getProperty("java.io.tmpdir")).toPath();
+        Assume.assumeTrue(challengeDirectory.getFileSystem().supportedFileAttributeViews().contains("posix"));
+
+        final Set<PosixFilePermission> expectedPermissions = PosixFilePermissions.fromString("rw-------");
+        final Map<String, Object> serverOptions = new HashMap<>();
+        serverOptions.put("jboss.sasl.local-user.challenge-file-permissions", "rw-------");
+
+        SaslServer server = new SaslServerBuilder(LocalUserServerFactory.class, LOCAL_USER)
+                .setUserName("George")
+                .setProperties(serverOptions)
+                .build();
+
+        try {
+            byte[] challenge = server.evaluateResponse(new byte[0]);
+            challenge = server.evaluateResponse(new byte[]{0});
+            final File file = new File(new String(challenge, StandardCharsets.UTF_8));
+
+            assertEquals("Unexpected permissions on challenge file.", expectedPermissions, Files.getPosixFilePermissions(file.toPath()));
+        } finally {
+            server.dispose();
+        }
     }
 
     /**
