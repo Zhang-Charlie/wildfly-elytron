@@ -26,8 +26,9 @@ import static org.wildfly.security.jose.jwk.JsonWebKeySetUtil.getKeys;
 
 import java.security.PublicKey;
 import java.util.ArrayList;
-import java.util.Map;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.http.client.methods.HttpGet;
 import org.wildfly.security.jose.jwk.JsonWebKeySet;
@@ -40,7 +41,7 @@ import org.wildfly.security.jose.jwk.JsonWebKeySet;
  * @author <a href="mailto:prpaul@redhat.com">Prarthona Paul</a>
  * */
 class JWKEncPublicKeyLocator implements PublicKeyLocator {
-    private List<PublicKey> currentKeys = new ArrayList<>();
+    private volatile List<PublicKey> currentKeys = Collections.emptyList();
 
     private volatile int lastRequestTime = 0;
 
@@ -58,8 +59,9 @@ class JWKEncPublicKeyLocator implements PublicKeyLocator {
         synchronized (this) {
             currentTime = getCurrentTime();
             if (currentTime > lastRequestTime + minTimeBetweenRequests) {
-                sendRequest(config);
-                lastRequestTime = currentTime;
+                if (sendRequest(config)) {
+                    lastRequestTime = currentTime;
+                }
             } else {
                 log.debug("Won't send request to jwks url. Last request time was " + lastRequestTime);
             }
@@ -71,13 +73,14 @@ class JWKEncPublicKeyLocator implements PublicKeyLocator {
     @Override
     public void reset(OidcClientConfiguration config) {
         synchronized (this) {
-            sendRequest(config);
-            lastRequestTime = getCurrentTime();
+            if (sendRequest(config)) {
+                lastRequestTime = getCurrentTime();
+            }
         }
     }
 
     private PublicKey lookupCachedKey(int publicKeyCacheTtl, int currentTime) {
-        if (lastRequestTime + publicKeyCacheTtl > currentTime) {
+        if (lastRequestTime + publicKeyCacheTtl > currentTime && ! currentKeys.isEmpty()) {
             return currentKeys.get(0); // returns the first cached public key
         } else {
             return null;
@@ -88,7 +91,7 @@ class JWKEncPublicKeyLocator implements PublicKeyLocator {
         return (int) (System.currentTimeMillis() / 1000);
     }
 
-    private void sendRequest(OidcClientConfiguration config) {
+    private boolean sendRequest(OidcClientConfiguration config) {
         if (log.isTraceEnabled()) {
             log.trace("Going to send request to retrieve new set of public keys to encrypt a JWT request for client " + config.getResourceName());
         }
@@ -104,10 +107,11 @@ class JWKEncPublicKeyLocator implements PublicKeyLocator {
             }
 
             // update current keys
-            currentKeys.clear();
-            currentKeys.addAll(publicKeys.values());
+            currentKeys = Collections.unmodifiableList(new ArrayList<>(publicKeys.values()));
+            return true;
         } catch (OidcException e) {
             log.error("Error when sending request to retrieve public keys", e);
+            return false;
         }
     }
 }
