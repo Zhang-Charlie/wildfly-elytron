@@ -19,10 +19,13 @@
 package org.wildfly.security.sasl.localuser;
 
 import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
 import java.security.SecureRandom;
@@ -30,6 +33,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 
 import javax.security.auth.callback.CallbackHandler;
 import javax.security.auth.callback.NameCallback;
@@ -57,6 +61,8 @@ final class LocalUserServer extends AbstractSaslServer implements SaslServer {
     public static final String LEGACY_LOCAL_USER_USE_SECURE_RANDOM = "jboss.sasl.local-user.use-secure-random";
     public static final String LOCAL_USER_CHALLENGE_PATH = "wildfly.sasl.local-user.challenge-path";
     public static final String LEGACY_LOCAL_USER_CHALLENGE_PATH = "jboss.sasl.local-user.challenge-path";
+    public static final String LOCAL_USER_CHALLENGE_FILE_PERMISSIONS = "wildfly.sasl.local-user.challenge-file-permissions";
+    public static final String LEGACY_LOCAL_USER_CHALLENGE_FILE_PERMISSIONS = "jboss.sasl.local-user.challenge-file-permissions";
     public static final String DEFAULT_USER = "wildfly.sasl.local-user.default-user";
     public static final String LEGACY_DEFAULT_USER = "jboss.sasl.local-user.default-user";
 
@@ -69,6 +75,7 @@ final class LocalUserServer extends AbstractSaslServer implements SaslServer {
     private volatile File challengeFile;
     private volatile byte[] challengeBytes;
     private final File basePath;
+    private final FileAttribute<?>[] challengeFileAttributes;
     private final String defaultUser;
     private final boolean useSecureRandom;
 
@@ -87,6 +94,7 @@ final class LocalUserServer extends AbstractSaslServer implements SaslServer {
         } else {
             basePath = new File(getProperty("java.io.tmpdir"));
         }
+        challengeFileAttributes = getChallengeFileAttributes(props, basePath.toPath());
 
         Object useSecureRandomObj = null;
         if (props.containsKey(LOCAL_USER_USE_SECURE_RANDOM)) {
@@ -125,6 +133,55 @@ final class LocalUserServer extends AbstractSaslServer implements SaslServer {
         return doPrivileged(new ReadPropertyAction(name, null));
     }
 
+    private static FileAttribute<?>[] getChallengeFileAttributes(final Map<String, ?> props, final Path basePath) {
+        Object challengeFilePermissions = null;
+        if (props.containsKey(LOCAL_USER_CHALLENGE_FILE_PERMISSIONS)) {
+            challengeFilePermissions = props.get(LOCAL_USER_CHALLENGE_FILE_PERMISSIONS);
+        } else if (props.containsKey(LEGACY_LOCAL_USER_CHALLENGE_FILE_PERMISSIONS)) {
+            challengeFilePermissions = props.get(LEGACY_LOCAL_USER_CHALLENGE_FILE_PERMISSIONS);
+        } else {
+            challengeFilePermissions = getProperty(LOCAL_USER_CHALLENGE_FILE_PERMISSIONS);
+            if (challengeFilePermissions == null) {
+                challengeFilePermissions = getProperty(LEGACY_LOCAL_USER_CHALLENGE_FILE_PERMISSIONS);
+            }
+        }
+
+        if (challengeFilePermissions == null) {
+            return new FileAttribute<?>[0];
+        }
+        if (challengeFilePermissions instanceof String) {
+            assertPosixViewSupported(basePath);
+            return new FileAttribute<?>[] { toPosixPermissions((String) challengeFilePermissions) };
+        }
+        if (challengeFilePermissions instanceof Set) {
+            assertPosixViewSupported(basePath);
+            @SuppressWarnings("unchecked")
+            final Set<PosixFilePermission> permissions = (Set<PosixFilePermission>) challengeFilePermissions;
+            return new FileAttribute<?>[] { PosixFilePermissions.asFileAttribute(permissions) };
+        }
+        if (challengeFilePermissions instanceof FileAttribute) {
+            return new FileAttribute<?>[] { (FileAttribute<?>) challengeFilePermissions };
+        }
+        if (challengeFilePermissions instanceof FileAttribute[]) {
+            return ((FileAttribute<?>[]) challengeFilePermissions).clone();
+        }
+        throw new IllegalArgumentException("Invalid challenge file permissions value: " + challengeFilePermissions);
+    }
+
+    private static void assertPosixViewSupported(final Path basePath) {
+        if (!basePath.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+            throw new IllegalArgumentException("POSIX challenge file permissions require a filesystem with POSIX attribute support: " + basePath);
+        }
+    }
+
+    private static FileAttribute<Set<PosixFilePermission>> toPosixPermissions(final String challengeFilePermissions) {
+        try {
+            return PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString(challengeFilePermissions));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Invalid challenge file permissions value: " + challengeFilePermissions, e);
+        }
+    }
+
     private static <T> T doPrivileged(final PrivilegedAction<T> action) {
         return System.getSecurityManager() != null ? AccessController.doPrivileged(action) : action.run();
     }
@@ -151,7 +208,10 @@ final class LocalUserServer extends AbstractSaslServer implements SaslServer {
 
     private void deleteChallenge() {
         if (challengeFile != null) {
-            challengeFile.delete();
+            try {
+                Files.deleteIfExists(challengeFile.toPath());
+            } catch (IOException ignored) {
+            }
             challengeFile = null;
         }
     }
@@ -178,38 +238,19 @@ final class LocalUserServer extends AbstractSaslServer implements SaslServer {
                     authorizationId = new String(message, StandardCharsets.UTF_8);
                 }
                 final Random random = getRandom();
+                final byte[] bytes = new byte[8];
+                random.nextBytes(bytes);
+                Path challengePath = null;
                 try {
-                    challengeFile = File.createTempFile("local", ".challenge", basePath);
-                } catch (IOException e) {
+                    challengePath = Files.createTempFile(basePath.toPath(), "local", ".challenge", challengeFileAttributes);
+                    Files.write(challengePath, bytes);
+                    challengeFile = challengePath.toFile();
+                } catch (IOException | UnsupportedOperationException e) {
+                    if (challengePath != null) try {
+                        Files.deleteIfExists(challengePath);
+                    } catch (IOException ignored) {
+                    }
                     throw saslLocal.mechFailedToCreateChallengeFile(e).toSaslException();
-                }
-
-                final FileOutputStream fos;
-                try {
-                    fos = new FileOutputStream(challengeFile);
-                } catch (FileNotFoundException e) {
-                    throw saslLocal.mechFailedToCreateChallengeFile(e).toSaslException();
-                }
-                boolean ok = false;
-                final byte[] bytes;
-                try {
-                    bytes = new byte[8];
-                    random.nextBytes(bytes);
-                    try {
-                        fos.write(bytes);
-                        fos.close();
-                        ok = true;
-                    } catch (IOException e) {
-                        throw saslLocal.mechFailedToCreateChallengeFile(e).toSaslException();
-                    }
-                } finally {
-                    if (!ok) {
-                        deleteChallenge();
-                    }
-                    try {
-                        fos.close();
-                    } catch (Throwable ignored) {
-                    }
                 }
                 challengeBytes = bytes;
                 final String path = challengeFile.getAbsolutePath();
