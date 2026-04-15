@@ -25,6 +25,7 @@ import static org.wildfly.security.http.oidc.Oidc.AuthenticationRequestFormat.RE
 import static org.wildfly.security.http.oidc.Oidc.AuthenticationRequestFormat.REQUEST_URI;
 import static org.wildfly.security.http.oidc.Oidc.SSLRequired;
 import static org.wildfly.security.http.oidc.Oidc.TokenStore;
+import static org.wildfly.security.http.oidc.Oidc.LOGOUT_PATH;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -195,6 +196,35 @@ public class OidcClientConfigurationBuilder {
 
         oidcClientConfiguration.setTokenSignatureAlgorithm(oidcJsonConfiguration.getTokenSignatureAlgorithm());
 
+        String tmpLogoutPath = oidcJsonConfiguration.getLogoutPath();
+        log.debugf("LOGOUT_PATH: " + tmpLogoutPath);
+        if (tmpLogoutPath != null) {
+            if (isValidPath(tmpLogoutPath)) {
+                oidcClientConfiguration.setLogoutPath(tmpLogoutPath);
+            } else {
+                throw log.invalidLogoutPath(tmpLogoutPath, LOGOUT_PATH);
+            }
+        } else {
+            oidcClientConfiguration.setLogoutPath(Oidc.DEFAULT_LOGOUT_PATH);
+        }
+
+        String tmpLogoutCallbackPath = oidcJsonConfiguration.getLogoutCallbackPath();
+        log.debugf("LOGOUT_CALLBACK_PATH: " + tmpLogoutCallbackPath);
+        if (tmpLogoutCallbackPath != null) {
+            oidcClientConfiguration.setLogoutCallbackPath(tmpLogoutCallbackPath);
+        } else {
+            oidcClientConfiguration.setLogoutCallbackPath(Oidc.DEFAULT_LOGOUT_CALLBACK_PATH);
+        }
+
+        String tmpPostLogoutUri = oidcJsonConfiguration.getPostLogoutRedirectUri();
+        log.debugf("POST_LOGOUT_REDIRECT_URI: " + tmpPostLogoutUri);
+        if (tmpPostLogoutUri != null) {
+            oidcClientConfiguration.setPostLogoutRedirectUri(tmpPostLogoutUri);
+        }
+
+        oidcClientConfiguration.setLogoutSessionRequired(oidcJsonConfiguration.isLogoutSessionRequired());
+        oidcClientConfiguration.setBackChannelLogoutSessionInvalidationLimit(oidcJsonConfiguration.getBackChannelLogoutSessionInvalidationLimit());
+        oidcClientConfiguration.setProviderJwtClaimsTyp(oidcJsonConfiguration.getProviderJwtClaimsTyp());
         return oidcClientConfiguration;
     }
 
@@ -236,4 +266,8 @@ public class OidcClientConfigurationBuilder {
         return new OidcClientConfigurationBuilder().internalBuild(oidcJsonConfiguration);
     }
 
+    private boolean isValidPath(String path) {
+        String tmpPath = path.trim();
+        return tmpPath.length() > 1 && tmpPath.startsWith("/");
+    }
 }

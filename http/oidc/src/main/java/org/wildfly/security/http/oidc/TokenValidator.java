@@ -26,6 +26,7 @@ import static org.wildfly.security.http.oidc.Oidc.INVALID_ISSUED_FOR_CLAIM;
 import static org.wildfly.security.http.oidc.Oidc.INVALID_SESSION_RANDOM_VALUE;
 import static org.wildfly.security.http.oidc.Oidc.INVALID_TYPE_CLAIM;
 import static org.wildfly.security.http.oidc.Oidc.getJavaAlgorithmForHash;
+import static org.wildfly.security.http.oidc.Oidc.LOGOUT_EVENTS_CLAIM_MEMBER_NAME;
 import static org.wildfly.security.jose.jwk.JWKUtil.BASE64_URL;
 
 import java.nio.charset.StandardCharsets;
@@ -33,10 +34,16 @@ import java.security.AccessController;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivilegedAction;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 
 import javax.crypto.SecretKey;
 
+import org.apache.http.HttpStatus;
 import org.jose4j.jwa.AlgorithmConstraints;
 import org.jose4j.jwt.JwtClaims;
 import org.jose4j.jwt.MalformedClaimException;
@@ -45,6 +52,7 @@ import org.jose4j.jwt.consumer.InvalidJwtException;
 import org.jose4j.jwt.consumer.JwtConsumer;
 import org.jose4j.jwt.consumer.JwtConsumerBuilder;
 import org.jose4j.jwt.consumer.JwtContext;
+import org.jose4j.jwt.consumer.NumericDateValidator;
 import org.wildfly.common.Assert;
 import org.wildfly.common.iteration.ByteIterator;
 
@@ -70,14 +78,51 @@ public class TokenValidator {
     private static final int HEADER_INDEX = 0;
     private JwtConsumerBuilder jwtConsumerBuilder;
     private OidcClientConfiguration clientConfiguration;
+    private String tokenType;
 
     private TokenValidator(Builder builder) {
         this.jwtConsumerBuilder = builder.jwtConsumerBuilder;
         this.clientConfiguration = builder.clientConfiguration;
+        this.tokenType = builder.tokenType;
     }
 
     public VerifiedTokens parseAndVerifyToken(final String idToken, final String accessToken) throws OidcException {
         return parseAndVerifyToken(idToken, accessToken, null, false);
+    }
+
+    public JwtClaims parseAndVerifyLogoutToken(final String token) throws OidcException {
+
+        JwtClaims jwtClaims;
+
+        try {
+            JwtContext jwtContext = setVerificationKey(token, jwtConsumerBuilder);
+            jwtConsumerBuilder.setRequireSubject();
+
+            if (clientConfiguration.isVerifyTokenAudience()) {
+                jwtConsumerBuilder.setExpectedAudience(clientConfiguration.getResourceName());
+            } else {
+                jwtConsumerBuilder.setSkipDefaultAudienceValidation();
+            }
+
+            if (! DISABLE_TYP_CLAIM_VALIDATION_PROPERTY) {
+                jwtConsumerBuilder.registerValidator(new TypeValidator(tokenType));
+            }
+            // check remaining logout related claims
+            jwtConsumerBuilder.registerValidator(new LogoutClaimsValidator(clientConfiguration));
+
+            // second pass to validate
+            jwtConsumerBuilder.build().processContext(jwtContext);
+            jwtClaims = jwtContext.getJwtClaims();
+            if (jwtClaims == null) {
+                throw log.invalidTokenClaims();
+            }
+        } catch (InvalidJwtException e) {
+            String msg = e.getErrorDetails().get(0).getErrorMessage();
+            log.tracef(msg, e);
+            throw new OidcException(msg, e);
+        }
+
+        return jwtClaims;
     }
 
     /**
@@ -115,17 +160,25 @@ public class TokenValidator {
     /**
      * Parse and verify the given bearer token.
      *
-     * @param bearerToken the bearer token
+     * @param token the bearer token
      * @return the {@code AccessToken} if the bearer token was valid
      * @throws OidcException if the bearer token is invalid
      */
-    public AccessToken parseAndVerifyToken(final String bearerToken) throws OidcException {
+    public AccessToken parseAndVerifyToken(final String token) throws OidcException {
+        return new AccessToken(verify(token));
+    }
+
+    public JwtClaims verify(String token) throws OidcException {
+        JwtClaims jwtClaims;
+
         try {
-            JwtContext jwtContext = setVerificationKey(bearerToken, jwtConsumerBuilder);
+            JwtContext jwtContext = setVerificationKey(token, jwtConsumerBuilder);
             jwtConsumerBuilder.setRequireSubject();
+
             if (! DISABLE_TYP_CLAIM_VALIDATION_PROPERTY) {
-                jwtConsumerBuilder.registerValidator(new TypeValidator("Bearer"));
+                jwtConsumerBuilder.registerValidator(new TypeValidator(tokenType));
             }
+
             if (clientConfiguration.isVerifyTokenAudience()) {
                 jwtConsumerBuilder.setExpectedAudience(clientConfiguration.getResourceName());
             } else {
@@ -133,15 +186,15 @@ public class TokenValidator {
             }
             // second pass to validate
             jwtConsumerBuilder.build().processContext(jwtContext);
-            JwtClaims jwtClaims = jwtContext.getJwtClaims();
+            jwtClaims = jwtContext.getJwtClaims();
             if (jwtClaims == null) {
-                throw log.invalidBearerTokenClaims();
+                throw log.invalidTokenClaims();
             }
-            return new AccessToken(jwtClaims);
         } catch (InvalidJwtException e) {
-            log.tracef("Problem parsing bearer token: " + bearerToken, e);
+            log.tracef("Problem parsing bearer token: " + token, e);
             throw log.invalidBearerToken(e);
         }
+        return jwtClaims;
     }
 
     private JwtContext setVerificationKey(final String token, final JwtConsumerBuilder jwtConsumerBuilder) throws InvalidJwtException {
@@ -174,6 +227,8 @@ public class TokenValidator {
     }
 
     public static class Builder {
+
+        public String tokenType = "Bearer";
         private OidcClientConfiguration clientConfiguration;
         private String expectedIssuer;
         private String clientId;
@@ -181,6 +236,7 @@ public class TokenValidator {
         private PublicKeyLocator publicKeyLocator;
         private SecretKey clientSecretKey;
         private JwtConsumerBuilder jwtConsumerBuilder;
+        private boolean skipExpirationValidator;
 
         /**
          * Construct a new uninitialized instance.
@@ -223,10 +279,23 @@ public class TokenValidator {
             jwtConsumerBuilder = new JwtConsumerBuilder()
                     .setExpectedIssuer(expectedIssuer)
                     .setJwsAlgorithmConstraints(
-                            new AlgorithmConstraints(AlgorithmConstraints.ConstraintType.PERMIT, expectedJwsAlgorithm))
-                    .setRequireExpirationTime();
+                            new AlgorithmConstraints(AlgorithmConstraints.ConstraintType.PERMIT, expectedJwsAlgorithm));
+
+            if (!skipExpirationValidator) {
+                jwtConsumerBuilder.setRequireExpirationTime();
+            }
 
             return new TokenValidator(this);
+        }
+
+        public Builder setSkipExpirationValidator() {
+            this.skipExpirationValidator = true;
+            return this;
+        }
+
+        public Builder setTokenType(String tokenType) {
+            this.tokenType = tokenType;
+            return this;
         }
     }
 
@@ -342,6 +411,159 @@ public class TokenValidator {
             if (! valid) {
                 return new ErrorCodeValidator.Error(INVALID_TYPE_CLAIM, log.unexpectedValueForTypeClaim());
             }
+            return null;
+        }
+    }
+
+    /*
+     * Spec, https://openid.net/specs/openid-connect-backchannel-1_0.html#Validation , section
+     * 2.6 describes the logout claims rules.
+     */
+    private static class LogoutClaimsValidator implements ErrorCodeValidator {
+
+        private OidcClientConfiguration clientConfiguration;
+
+        public LogoutClaimsValidator(OidcClientConfiguration clientConfiguration) {
+            this.clientConfiguration = clientConfiguration;
+        }
+
+        public ErrorCodeValidator.Error validate(JwtContext jwtContext) throws MalformedClaimException {
+            List<String> requiredLogoutClaims = new ArrayList<>();
+            Collections.addAll(requiredLogoutClaims, "alg", "iss", "aud", "iat",
+                "exp", "sub", "sid", "events");
+
+            JwtClaims jwtClaims = jwtContext.getJwtClaims();
+            boolean isSubOrSidPresent = false;
+            Collection<String> claimNames = jwtClaims.getClaimNames();
+            try {
+                for (String key: claimNames) {
+                    switch (key.toLowerCase()) {
+                        case "alg":
+                            requiredLogoutClaims.remove(key);
+                            if (jwtClaims.getStringClaimValue(key).equalsIgnoreCase("none")) {
+                                return new ErrorCodeValidator.Error(HttpStatus.SC_BAD_REQUEST,
+                                    log.algClaimCanNotHaveValueNone());
+                            }
+                            break;
+                        case "nonce":
+                            if (jwtClaims.getStringClaimValue("nonce") != null) {
+                                return new ErrorCodeValidator.Error(HttpStatus.SC_BAD_REQUEST,
+                                    log.nonceClaimIsNotAllowed());
+                            }
+                            break;
+                        case "iss":
+                            requiredLogoutClaims.remove(key);
+                            String issuer = jwtClaims.getStringClaimValue("iss");
+                            if (issuer != null && !issuer.isEmpty()) {
+                                String providerUrl = clientConfiguration.getProviderUrl();
+                                if (providerUrl.isEmpty() || !issuer.equalsIgnoreCase(providerUrl)) {
+                                    return new ErrorCodeValidator.Error(HttpStatus.SC_BAD_REQUEST,
+                                        log.noMatchingValueFoundForClaim(key));
+                                }
+                            } else {
+                                return new ErrorCodeValidator.Error(HttpStatus.SC_BAD_REQUEST,
+                                    log.anIssClaimIsRequired());
+                            }
+                            break;
+                        case "aud":
+                            requiredLogoutClaims.remove(key);
+                            String audience = this.clientConfiguration.getResourceName();
+                            if (audience != null && !audience.isEmpty()) {
+                                List<String> audList = jwtClaims.getAudience();
+                                if (audList != null && !audList.isEmpty()) {
+                                    if (!audList.contains(audience)) {
+                                        return new ErrorCodeValidator.Error(HttpStatus.SC_BAD_REQUEST,
+                                            log.noMatchingValueFoundForClaim(key));
+                                    }
+                                }
+                            }
+                            break;
+                        case "iat":
+                            requiredLogoutClaims.remove(key);
+                            Object iatValue = jwtClaims.getClaimValue(key);
+                            if (iatValue != null && (iatValue instanceof Long)) {
+                                if ((Long)iatValue < clientConfiguration.getNotBefore()) {
+                                    return new ErrorCodeValidator.Error(HttpStatus.SC_BAD_REQUEST,
+                                        log.valueForIatClaimIsBeforeAllowedTime());
+                                }
+                            } else {
+                                if (!(iatValue instanceof Long)) {
+                                    return new ErrorCodeValidator.Error(HttpStatus.SC_BAD_REQUEST,
+                                        log.invalidDatatypeForIat());
+                                }
+                            }
+                            break;
+                        case "exp":
+                            requiredLogoutClaims.remove(key);
+                            // this value by NumericDateValidator at the bottom of this method
+                            break;
+                        case "sub":
+                            requiredLogoutClaims.remove(key);
+                            String sub = jwtClaims.getStringClaimValue(key);
+                            if (sub != null && !sub.isEmpty()) {
+                                isSubOrSidPresent = true;
+                            }
+                            break;
+                        case "sid":
+                            requiredLogoutClaims.remove(key);
+                            String sid = jwtClaims.getStringClaimValue(key);
+                            if (sid != null && !sid.isEmpty()) {
+                                isSubOrSidPresent = true;
+                            }
+                            break;
+                        case "events":
+                            requiredLogoutClaims.remove(key);
+                            Map<String, Object> eventsMap = jwtClaims.getClaimValue(key, Map.class);
+                            if (eventsMap != null) {
+                                if (!eventsMap.containsKey(LOGOUT_EVENTS_CLAIM_MEMBER_NAME)) {
+                                    return new ErrorCodeValidator.Error(HttpStatus.SC_BAD_REQUEST,
+                                        log.eventsClaimDoesNotContainTheRequiredMemberName());
+                                }
+                            } else {
+                                return new ErrorCodeValidator.Error(HttpStatus.SC_BAD_REQUEST,
+                                    log.requiredEventsClaimNotFound());
+                            }
+                            break;
+                    }
+                }
+            } catch (MalformedClaimException e) {
+                return new ErrorCodeValidator.Error(HttpStatus.SC_BAD_REQUEST,
+                    log.malformedClaimException(e.toString()));
+            }
+
+            if (!isSubOrSidPresent) {
+                return new ErrorCodeValidator.Error(HttpStatus.SC_BAD_REQUEST,
+                    log.neitherClaimSubNorSidIsPresent());
+            }
+
+
+            // ignore alg; it is processed by another validator
+            requiredLogoutClaims.remove("alg");
+            if (!requiredLogoutClaims.isEmpty()) {
+                for (String k : requiredLogoutClaims) {
+                    switch (k) {
+                        case "sub":
+                            // this is allowed; sid must be present
+                            break;
+                        case "sid":
+                            // this is allowed; sub must be present
+                            break;
+                        default:
+                            return new ErrorCodeValidator.Error(HttpStatus.SC_BAD_REQUEST,
+                                log.requiredLogoutClaimIsMissing(k));
+                    }
+                }
+            }
+
+            // validate EXP
+            NumericDateValidator ndv = new NumericDateValidator();
+            ndv.setRequireExp(true);
+            ndv.setRequireIat(true);
+            Error validateError = ndv.validate(jwtContext);
+            if (validateError != null) {
+                return validateError;
+            }
+
             return null;
         }
     }

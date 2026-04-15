@@ -63,6 +63,8 @@ public class KeycloakContainer extends GenericContainer<KeycloakContainer> {
         withEnv("KEYCLOAK_ADMIN", KEYCLOAK_ADMIN_USER);
         withEnv("KEYCLOAK_ADMIN_PASSWORD", KEYCLOAK_ADMIN_PASSWORD);
         withCommand("start-dev");
+        // Enable host access so the container can reach back to the host for backchannel logout callbacks
+        withAccessToHost(true);
     }
 
     public String getAuthServerUrl() {
