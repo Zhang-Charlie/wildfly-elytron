@@ -52,6 +52,7 @@ import java.security.KeyStore;
 import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
 import java.security.Provider;
+import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.Security;
 import java.security.cert.Certificate;
@@ -184,6 +185,61 @@ public class KeyStoreUtilTest {
 
     @Test
     public void testKubernetesTlsSecretPemAsKeyStore() throws Exception {
+        KubernetesTlsMaterial tlsMaterial = createKubernetesTlsMaterial();
+
+        KeyStore keyStore = KeyStoreUtil.loadPemAsKeyStore(new ByteArrayInputStream(tlsMaterial.tlsKeyAndCertificate), new char[0]);
+        String alias = tlsMaterial.certificate.getSubjectX500Principal().getName();
+
+        Assert.assertNotNull(keyStore);
+        Assert.assertEquals(1, keyStore.size());
+        Assert.assertTrue(keyStore.isKeyEntry(alias));
+        Assert.assertArrayEquals(tlsMaterial.keyPair.getPrivate().getEncoded(), keyStore.getKey(alias, new char[0]).getEncoded());
+        Assert.assertEquals(2, keyStore.getCertificateChain(alias).length);
+        Assert.assertEquals(tlsMaterial.certificate, keyStore.getCertificateChain(alias)[0]);
+        Assert.assertEquals(tlsMaterial.ca.getSelfSignedCertificate(), keyStore.getCertificateChain(alias)[1]);
+    }
+
+    @Test
+    public void testKubernetesTlsCrtAsCertificateChain() throws Exception {
+        KubernetesTlsMaterial tlsMaterial = createKubernetesTlsMaterial();
+
+        X509Certificate[] certificateChain = KeyStoreUtil.loadPemX509CertificateChain(new ByteArrayInputStream(tlsMaterial.tlsCrt));
+
+        Assert.assertEquals(2, certificateChain.length);
+        Assert.assertEquals(tlsMaterial.certificate, certificateChain[0]);
+        Assert.assertEquals(tlsMaterial.ca.getSelfSignedCertificate(), certificateChain[1]);
+    }
+
+    @Test
+    public void testKubernetesTlsKeyAsPrivateKey() throws Exception {
+        KubernetesTlsMaterial tlsMaterial = createKubernetesTlsMaterial();
+
+        PrivateKey privateKey = KeyStoreUtil.loadPemPrivateKey(new ByteArrayInputStream(tlsMaterial.tlsKey));
+
+        Assert.assertArrayEquals(tlsMaterial.keyPair.getPrivate().getEncoded(), privateKey.getEncoded());
+    }
+
+    @Test
+    public void testLoadPemX509CertificateChainFailsWithNoCertificate() throws Exception {
+        KubernetesTlsMaterial tlsMaterial = createKubernetesTlsMaterial();
+
+        IllegalArgumentException exception = Assert.assertThrows(IllegalArgumentException.class,
+                () -> KeyStoreUtil.loadPemX509CertificateChain(new ByteArrayInputStream(tlsMaterial.tlsKey)));
+
+        Assert.assertEquals("PEM content does not contain an X.509 certificate", exception.getMessage());
+    }
+
+    @Test
+    public void testLoadPemPrivateKeyFailsWithNoPrivateKey() throws Exception {
+        KubernetesTlsMaterial tlsMaterial = createKubernetesTlsMaterial();
+
+        IllegalArgumentException exception = Assert.assertThrows(IllegalArgumentException.class,
+                () -> KeyStoreUtil.loadPemPrivateKey(new ByteArrayInputStream(tlsMaterial.tlsCrt)));
+
+        Assert.assertEquals("PEM content does not contain a private key", exception.getMessage());
+    }
+
+    private KubernetesTlsMaterial createKubernetesTlsMaterial() throws Exception {
         SelfSignedX509CertificateAndSigningKey ca = SelfSignedX509CertificateAndSigningKey.builder()
                 .setDn(new X500Principal("CN=Test CA"))
                 .setKeyAlgorithmName("RSA")
@@ -198,23 +254,41 @@ public class KeyStoreUtilTest {
                 .setSigningKey(ca.getSigningKey())
                 .setPublicKey(keyPair.getPublic())
                 .build();
+
+        ByteStringBuilder tlsKey = new ByteStringBuilder();
+        Pem.generatePemContent(tlsKey, "PRIVATE KEY", ByteIterator.ofBytes(keyPair.getPrivate().getEncoded()));
+
+        ByteStringBuilder tlsCrt = new ByteStringBuilder();
+        Pem.generatePemX509Certificate(tlsCrt, certificate);
+        Pem.generatePemX509Certificate(tlsCrt, ca.getSelfSignedCertificate());
+
         ByteStringBuilder tlsKeyAndCertificate = new ByteStringBuilder();
-        Pem.generatePemContent(tlsKeyAndCertificate, "PRIVATE KEY", ByteIterator.ofBytes(keyPair.getPrivate().getEncoded()));
-        Pem.generatePemX509Certificate(tlsKeyAndCertificate, certificate);
-        Pem.generatePemX509Certificate(tlsKeyAndCertificate, ca.getSelfSignedCertificate());
+        tlsKeyAndCertificate.append(tlsKey.toArray());
+        tlsKeyAndCertificate.append(tlsCrt.toArray());
 
-        KeyStore keyStore = KeyStoreUtil.loadPemAsKeyStore(new ByteArrayInputStream(tlsKeyAndCertificate.toArray()), new char[0]);
-        String alias = certificate.getSubjectX500Principal().getName();
-
-        Assert.assertNotNull(keyStore);
-        Assert.assertEquals(1, keyStore.size());
-        Assert.assertTrue(keyStore.isKeyEntry(alias));
-        Assert.assertArrayEquals(keyPair.getPrivate().getEncoded(), keyStore.getKey(alias, new char[0]).getEncoded());
-        Assert.assertEquals(2, keyStore.getCertificateChain(alias).length);
-        Assert.assertEquals(certificate, keyStore.getCertificateChain(alias)[0]);
-        Assert.assertEquals(ca.getSelfSignedCertificate(), keyStore.getCertificateChain(alias)[1]);
+        return new KubernetesTlsMaterial(ca, keyPair, certificate, tlsKey.toArray(), tlsCrt.toArray(),
+                tlsKeyAndCertificate.toArray());
     }
 
+    private static final class KubernetesTlsMaterial {
+
+        private final SelfSignedX509CertificateAndSigningKey ca;
+        private final KeyPair keyPair;
+        private final X509Certificate certificate;
+        private final byte[] tlsKey;
+        private final byte[] tlsCrt;
+        private final byte[] tlsKeyAndCertificate;
+
+        private KubernetesTlsMaterial(SelfSignedX509CertificateAndSigningKey ca, KeyPair keyPair,
+                X509Certificate certificate, byte[] tlsKey, byte[] tlsCrt, byte[] tlsKeyAndCertificate) {
+            this.ca = ca;
+            this.keyPair = keyPair;
+            this.certificate = certificate;
+            this.tlsKey = tlsKey;
+            this.tlsCrt = tlsCrt;
+            this.tlsKeyAndCertificate = tlsKeyAndCertificate;
+        }
+    }
 
     private void generateKeyStoreWithKey(String filename, String type, String alias, char[] password, Certificate cert) throws KeyStoreException, NoSuchAlgorithmException, IOException, CertificateException {
         File keyStoreFile = new File(workingDir, filename);

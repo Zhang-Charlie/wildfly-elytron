@@ -156,22 +156,9 @@ public class KeyStoreUtil {
             // won't happen
         }
         // try to load it as a PEM
-        PrivateKey pk = null;
-        List<Certificate> certificates = new ArrayList<>();
-        // Reading all of the file should not be an issue
-        byte[] pem = readAllBytes(is);
-        is.read(pem);
-        for (Iterator<PemEntry<?>> it = Pem.parsePemContent(CodePointIterator.ofUtf8Bytes(pem)); it.hasNext(); ) {
-            Object entry = it.next().getEntry();
-            if (entry instanceof PrivateKey) {
-                // Private key
-                pk = (PrivateKey) entry;
-            } else if (entry instanceof Certificate) {
-                // Certificate
-                Certificate certificate = (Certificate) entry;
-                certificates.add(certificate);
-            }
-        }
+        PemEntries pemEntries = loadPemEntries(is);
+        PrivateKey pk = pemEntries.privateKey;
+        List<X509Certificate> certificates = pemEntries.certificates;
         if (pk != null) {
             // A keystore
             Certificate certificate = certificates.get(0);
@@ -188,6 +175,37 @@ public class KeyStoreUtil {
         return keyStore;
     }
 
+    static X509Certificate[] loadPemX509CertificateChain(InputStream is) throws IOException {
+        List<X509Certificate> certificates = loadPemEntries(is).certificates;
+        if (certificates.isEmpty()) {
+            throw new IllegalArgumentException("PEM content does not contain an X.509 certificate");
+        }
+        return certificates.toArray(new X509Certificate[0]);
+    }
+
+    static PrivateKey loadPemPrivateKey(InputStream is) throws IOException {
+        PrivateKey privateKey = loadPemEntries(is).privateKey;
+        if (privateKey == null) {
+            throw new IllegalArgumentException("PEM content does not contain a private key");
+        }
+        return privateKey;
+    }
+
+    private static PemEntries loadPemEntries(InputStream is) throws IOException {
+        PrivateKey privateKey = null;
+        List<X509Certificate> certificates = new ArrayList<>();
+        byte[] pem = readAllBytes(is);
+        for (Iterator<PemEntry<?>> it = Pem.parsePemContent(CodePointIterator.ofUtf8Bytes(pem)); it.hasNext(); ) {
+            Object entry = it.next().getEntry();
+            if (entry instanceof PrivateKey) {
+                privateKey = (PrivateKey) entry;
+            } else if (entry instanceof X509Certificate) {
+                certificates.add((X509Certificate) entry);
+            }
+        }
+        return new PemEntries(privateKey, certificates);
+    }
+
     private static byte[] readAllBytes(InputStream inputStream) throws IOException {
         ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
         byte[] buffer = new byte[1024];
@@ -199,6 +217,17 @@ public class KeyStoreUtil {
             readBytes = inputStream.read(buffer);
         }
         return outputStream.toByteArray();
+    }
+
+    private static final class PemEntries {
+
+        private final PrivateKey privateKey;
+        private final List<X509Certificate> certificates;
+
+        private PemEntries(PrivateKey privateKey, List<X509Certificate> certificates) {
+            this.privateKey = privateKey;
+            this.certificates = certificates;
+        }
     }
 
     //FileInputStream does not support marking by default and buffering unknown sized file doesn't seem right
