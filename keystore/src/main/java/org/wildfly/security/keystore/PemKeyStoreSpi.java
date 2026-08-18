@@ -212,6 +212,12 @@ public final class PemKeyStoreSpi extends KeyStoreSpi {
         if (privateKey == null) {
             throw new IOException("PEM private key file does not contain a private key");
         }
+        if (certificateEntries.getPrivateKey() != null) {
+            throw new IOException("PEM certificate file must not contain a private key: \"" + pemParameter.getCertificatePath() + "\"");
+        }
+        if (! privateKeyEntries.getCertificates().isEmpty()) {
+            throw new IOException("PEM private key file must not contain an X.509 certificate: \"" + pemParameter.getPrivateKeyPath() + "\"");
+        }
         keyStore = PemKeyStoreUtil.createKeyStore(new PemKeyStoreUtil.PemEntries(privateKey, certificates), pemParameter.getAlias(), password);
     }
 

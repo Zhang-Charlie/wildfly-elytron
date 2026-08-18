@@ -29,6 +29,7 @@ import java.security.KeyStore;
 import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
+import java.security.PublicKey;
 import java.security.Signature;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateException;
@@ -54,6 +55,7 @@ final class PemKeyStoreUtil {
         PrivateKey privateKey = null;
         List<X509Certificate> certificates = new ArrayList<X509Certificate>();
         byte[] pem = readAllBytes(is);
+        rejectEncryptedPrivateKeys(pem);
         try {
             for (Iterator<PemEntry<?>> it = Pem.parsePemContent(CodePointIterator.ofUtf8Bytes(pem)); it.hasNext(); ) {
                 Object entry = it.next().getEntry();
@@ -64,12 +66,31 @@ final class PemKeyStoreUtil {
                     privateKey = (PrivateKey) entry;
                 } else if (entry instanceof X509Certificate) {
                     certificates.add((X509Certificate) entry);
+                } else if (entry instanceof PublicKey) {
+                    throw new IOException("PEM content contains an unsupported public key entry");
                 }
             }
         } catch (IllegalArgumentException e) {
             throw new IOException("Unable to parse PEM content", e);
         }
         return new PemEntries(privateKey, certificates);
+    }
+
+    private static void rejectEncryptedPrivateKeys(byte[] pem) throws IOException {
+        CodePointIterator iterator = CodePointIterator.ofUtf8Bytes(pem);
+        try {
+            String type;
+            while ((type = Pem.parsePemContent(iterator, (pemType, content) -> {
+                content.drain();
+                return pemType;
+            })) != null) {
+                if ("ENCRYPTED PRIVATE KEY".equals(type)) {
+                    throw new IOException("Encrypted PEM private keys are not supported");
+                }
+            }
+        } catch (IllegalArgumentException e) {
+            throw new IOException("Unable to parse PEM content", e);
+        }
     }
 
     static KeyStore createKeyStore(PemEntries pemEntries, String alias, char[] password) throws IOException, NoSuchAlgorithmException, CertificateException {

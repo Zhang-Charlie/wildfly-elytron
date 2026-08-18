@@ -30,6 +30,7 @@ import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
 import java.security.KeyStoreException;
+import java.security.interfaces.RSAPrivateCrtKey;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
@@ -46,6 +47,7 @@ import org.junit.Test;
 import org.junit.function.ThrowingRunnable;
 import org.wildfly.common.bytes.ByteStringBuilder;
 import org.wildfly.common.iteration.ByteIterator;
+import org.wildfly.security.asn1.DEREncoder;
 import org.wildfly.security.pem.Pem;
 import org.wildfly.security.x500.cert.SelfSignedX509CertificateAndSigningKey;
 import org.wildfly.security.x500.cert.X509CertificateBuilder;
@@ -84,6 +86,28 @@ public class PemKeyStoreTest {
         KeyStore keyStore = createPemKeyStore();
 
         keyStore.load(new ByteArrayInputStream(createCombinedPem(material)), PASSWORD);
+
+        assertKeyEntry(keyStore, material.subjectCertificate.getSubjectX500Principal().getName(), material, PASSWORD);
+    }
+
+    @Test
+    public void testCombinedEcPkcs8PrivateKeyLoads() throws Exception {
+        KeyPairGenerator ecKeyPairGenerator = KeyPairGenerator.getInstance("EC");
+        ecKeyPairGenerator.initialize(256);
+        TestMaterial material = createMaterial("EcPkcs8", ecKeyPairGenerator.generateKeyPair());
+        KeyStore keyStore = createPemKeyStore();
+
+        keyStore.load(new ByteArrayInputStream(createCombinedPem(material)), PASSWORD);
+
+        assertKeyEntry(keyStore, material.subjectCertificate.getSubjectX500Principal().getName(), material, PASSWORD);
+    }
+
+    @Test
+    public void testCombinedRsaPkcs1PrivateKeyLoads() throws Exception {
+        TestMaterial material = createMaterial("RsaPkcs1");
+        KeyStore keyStore = createPemKeyStore();
+
+        keyStore.load(new ByteArrayInputStream(createCombinedRsaPkcs1Pem(material)), PASSWORD);
 
         assertKeyEntry(keyStore, material.subjectCertificate.getSubjectX500Principal().getName(), material, PASSWORD);
     }
@@ -202,6 +226,71 @@ public class PemKeyStoreTest {
 
         Assert.assertEquals("Unable to parse PEM content", exception.getMessage());
         Assert.assertNotNull(exception.getCause());
+    }
+
+    @Test
+    public void testEncryptedPrivateKeyFailsClearly() throws Exception {
+        TestMaterial material = createMaterial("EncryptedPrivateKey");
+        ByteStringBuilder target = new ByteStringBuilder();
+        Pem.generatePemContent(target, "ENCRYPTED PRIVATE KEY",
+                ByteIterator.ofBytes(material.keyPair.getPrivate().getEncoded()));
+        Pem.generatePemX509Certificate(target, material.subjectCertificate);
+        KeyStore keyStore = createPemKeyStore();
+
+        IOException exception = Assert.assertThrows(IOException.class,
+                () -> keyStore.load(new ByteArrayInputStream(target.toArray()), PASSWORD));
+
+        Assert.assertEquals("Encrypted PEM private keys are not supported", exception.getMessage());
+    }
+
+    @Test
+    public void testPublicKeyEntryFailsClearly() throws Exception {
+        TestMaterial material = createMaterial("PublicKey");
+        ByteStringBuilder target = new ByteStringBuilder();
+        Pem.generatePemPublicKey(target, material.keyPair.getPublic());
+        Pem.generatePemX509Certificate(target, material.subjectCertificate);
+        KeyStore keyStore = createPemKeyStore();
+
+        IOException exception = Assert.assertThrows(IOException.class,
+                () -> keyStore.load(new ByteArrayInputStream(target.toArray()), PASSWORD));
+
+        Assert.assertEquals("PEM content contains an unsupported public key entry", exception.getMessage());
+    }
+
+    @Test
+    public void testEmptyAndWhitespaceOnlyPemCreateEmptyKeyStores() throws Exception {
+        KeyStore empty = createPemKeyStore();
+        KeyStore whitespace = createPemKeyStore();
+
+        empty.load(new ByteArrayInputStream(new byte[0]), PASSWORD);
+        whitespace.load(new ByteArrayInputStream(" \n\r\t".getBytes(StandardCharsets.US_ASCII)), PASSWORD);
+
+        Assert.assertEquals(0, empty.size());
+        Assert.assertEquals(0, whitespace.size());
+    }
+
+    @Test
+    public void testCertificateFileRejectsPrivateKey() throws Exception {
+        TestMaterial material = createMaterial("PrivateKeyInCertificateFile");
+        Path certificatePath = write("unexpected-private-key.crt", createCombinedPem(material));
+        Path privateKeyPath = write("valid-for-unexpected-private-key.key", createPrivateKeyPem(material));
+
+        IOException exception = assertSeparateLoadFails(certificatePath, privateKeyPath);
+
+        Assert.assertEquals("PEM certificate file must not contain a private key: \"" + certificatePath + "\"",
+                exception.getMessage());
+    }
+
+    @Test
+    public void testPrivateKeyFileRejectsCertificate() throws Exception {
+        TestMaterial material = createMaterial("CertificateInPrivateKeyFile");
+        Path certificatePath = write("valid-for-unexpected-certificate.crt", createCertificatePem(material));
+        Path privateKeyPath = write("unexpected-certificate.key", createCombinedPem(material));
+
+        IOException exception = assertSeparateLoadFails(certificatePath, privateKeyPath);
+
+        Assert.assertEquals("PEM private key file must not contain an X.509 certificate: \"" + privateKeyPath + "\"",
+                exception.getMessage());
     }
 
     @Test
@@ -427,7 +516,21 @@ public class PemKeyStoreTest {
                 .setSignatureAlgorithmName("SHA256withRSA")
                 .addExtension(false, "BasicConstraints", "CA:true,pathlen:2147483647")
                 .build();
-        KeyPair keyPair = keyPairGenerator.generateKeyPair();
+        return createMaterial(commonName, ca, keyPairGenerator.generateKeyPair());
+    }
+
+    private TestMaterial createMaterial(String commonName, KeyPair keyPair) throws Exception {
+        SelfSignedX509CertificateAndSigningKey ca = SelfSignedX509CertificateAndSigningKey.builder()
+                .setDn(new X500Principal("O=Root Certificate Authority, EMAILADDRESS=elytron@wildfly.org, C=UK, ST=Elytron, CN=Elytron CA " + commonName))
+                .setKeyAlgorithmName("RSA")
+                .setSignatureAlgorithmName("SHA256withRSA")
+                .addExtension(false, "BasicConstraints", "CA:true,pathlen:2147483647")
+                .build();
+        return createMaterial(commonName, ca, keyPair);
+    }
+
+    private TestMaterial createMaterial(String commonName, SelfSignedX509CertificateAndSigningKey ca, KeyPair keyPair)
+            throws Exception {
         X509Certificate subjectCertificate = new X509CertificateBuilder()
                 .setIssuerDn(ca.getSelfSignedCertificate().getIssuerX500Principal())
                 .setSubjectDn(new X500Principal("O=Elytron, OU=Elytron, C=UK, ST=Elytron, CN=" + commonName))
@@ -441,6 +544,28 @@ public class PemKeyStoreTest {
     private byte[] createCombinedPem(TestMaterial material) {
         ByteStringBuilder target = new ByteStringBuilder();
         Pem.generatePemContent(target, "PRIVATE KEY", ByteIterator.ofBytes(material.keyPair.getPrivate().getEncoded()));
+        Pem.generatePemX509Certificate(target, material.subjectCertificate);
+        Pem.generatePemX509Certificate(target, material.ca.getSelfSignedCertificate());
+        return target.toArray();
+    }
+
+    private byte[] createCombinedRsaPkcs1Pem(TestMaterial material) {
+        RSAPrivateCrtKey privateKey = (RSAPrivateCrtKey) material.keyPair.getPrivate();
+        DEREncoder encoder = new DEREncoder();
+        encoder.startSequence();
+        encoder.encodeInteger(0);
+        encoder.encodeInteger(privateKey.getModulus());
+        encoder.encodeInteger(privateKey.getPublicExponent());
+        encoder.encodeInteger(privateKey.getPrivateExponent());
+        encoder.encodeInteger(privateKey.getPrimeP());
+        encoder.encodeInteger(privateKey.getPrimeQ());
+        encoder.encodeInteger(privateKey.getPrimeExponentP());
+        encoder.encodeInteger(privateKey.getPrimeExponentQ());
+        encoder.encodeInteger(privateKey.getCrtCoefficient());
+        encoder.endSequence();
+
+        ByteStringBuilder target = new ByteStringBuilder();
+        Pem.generatePemContent(target, "RSA PRIVATE KEY", ByteIterator.ofBytes(encoder.getEncoded()));
         Pem.generatePemX509Certificate(target, material.subjectCertificate);
         Pem.generatePemX509Certificate(target, material.ca.getSelfSignedCertificate());
         return target.toArray();
