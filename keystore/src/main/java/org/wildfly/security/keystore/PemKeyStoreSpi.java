@@ -40,7 +40,9 @@ import java.util.Enumeration;
 import java.util.List;
 
 /**
- * A read-only PEM {@link KeyStore} implementation.
+ * A read-only PEM {@link KeyStore} implementation.  Loading from an {@link InputStream} accepts combined PEM
+ * certificate and unencrypted private-key content.  Loading separate certificate and private-key files requires a
+ * {@link PemKeyStoreLoadParameter}.  A {@code null} input stream initializes an empty KeyStore.
  */
 public final class PemKeyStoreSpi extends KeyStoreSpi {
 

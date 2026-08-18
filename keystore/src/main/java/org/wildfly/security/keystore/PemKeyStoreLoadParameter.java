@@ -24,7 +24,10 @@ import java.nio.file.Path;
 import java.security.KeyStore;
 
 /**
- * Load parameters for a PEM {@link KeyStore} backed by separate certificate and private key files.
+ * Load parameters for a PEM {@link KeyStore} backed by separate certificate and private key files.  The certificate
+ * file contains the leaf certificate followed by any issuer certificates in chain order.  The private key file
+ * contains one unencrypted private key.  The paths are read when the KeyStore is loaded, not when this parameter is
+ * constructed.
  */
 public final class PemKeyStoreLoadParameter implements KeyStore.LoadStoreParameter {
 
@@ -38,6 +41,7 @@ public final class PemKeyStoreLoadParameter implements KeyStore.LoadStoreParamet
      *
      * @param certificatePath the PEM certificate path (must not be {@code null})
      * @param privateKeyPath the PEM private key path (must not be {@code null})
+     * @throws IllegalArgumentException if either path is {@code null}
      */
     public PemKeyStoreLoadParameter(Path certificatePath, Path privateKeyPath) {
         this(certificatePath, privateKeyPath, null, null);
@@ -49,6 +53,7 @@ public final class PemKeyStoreLoadParameter implements KeyStore.LoadStoreParamet
      * @param certificatePath the PEM certificate path (must not be {@code null})
      * @param privateKeyPath the PEM private key path (must not be {@code null})
      * @param alias the key entry alias, or {@code null} to use {@code tls}
+     * @throws IllegalArgumentException if either path is {@code null}
      */
     public PemKeyStoreLoadParameter(Path certificatePath, Path privateKeyPath, String alias) {
         this(certificatePath, privateKeyPath, alias, null);
@@ -91,7 +96,7 @@ public final class PemKeyStoreLoadParameter implements KeyStore.LoadStoreParamet
     /**
      * Get the key entry alias.
      *
-     * @return the key entry alias
+     * @return the key entry alias (never {@code null})
      */
     public String getAlias() {
         return alias;
